@@ -438,7 +438,7 @@ func newSyncerV2(db ethdb.Database, scheme string) *syncerV2 {
 		peers:    make(map[string]SyncPeerV2),
 		peerJoin: new(event.Feed),
 		peerDrop: new(event.Feed),
-		rates:    msgrate.NewTrackers(log.New("proto", "snap")),
+		rates:    msgrate.NewTrackers(log.New("proto", "snap"), 0),
 		update:   make(chan struct{}, 1),
 
 		statelessPeers:   make(map[string]struct{}),
@@ -678,7 +678,23 @@ func (s *syncerV2) Sync(target *types.Header, cancel chan struct{}) error {
 	if err := batch.Write(); err != nil {
 		return err
 	}
+	// Mirror the live generation progress into the metrics while it runs
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Second * 30)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				genProgressGauge.Update(int64(s.genProgress.Load()))
+			case <-stop:
+				return
+			}
+		}
+	}()
 	_, genErr := triedb.GenerateTrieWithProgress(s.db, s.scheme, root, cancel, &s.genProgress)
+	close(stop)
+	genProgressGauge.Update(int64(s.genProgress.Load()))
 	if genErr != nil {
 		return genErr
 	}
@@ -1057,6 +1073,8 @@ func (s *syncerV2) fetchAccessLists(hashes []common.Hash, headers map[common.Has
 		s.accessListSynced += uint64(len(fetched) - lastFetched)
 		lastFetched = len(fetched)
 		s.refreshProgressLocked()
+		balFetchedGauge.Update(int64(s.accessListSynced))
+		balTotalGauge.Update(int64(s.accessListTotal))
 		s.lock.Unlock()
 	}
 	// Assemble results in input order
@@ -2534,7 +2552,11 @@ func (s *syncerV2) OnAccounts(peer SyncPeerV2, id uint64, hashes []common.Hash, 
 	for i, node := range proof {
 		nodes[i] = node
 	}
-	cont, err := trie.VerifyRangeProof(root, req.origin[:], keys, accounts, nodes.Set())
+	firstKey, proofdb := req.origin[:], ethdb.KeyValueReader(nodes.Set())
+	if len(nodes) == 0 && req.origin == (common.Hash{}) {
+		firstKey, proofdb = nil, nil
+	}
+	cont, err := trie.VerifyRangeProof(root, firstKey, keys, accounts, proofdb)
 	if err != nil {
 		logger.Warn("Account range failed proof", "err", err)
 
@@ -2941,6 +2963,13 @@ func (s *syncerV2) reportSyncProgressV2(force bool) {
 		storage  = fmt.Sprintf("%v@%v", log.FormatLogfmtUint64(s.storageSynced), s.storageBytes.TerminalString())
 		bytecode = fmt.Sprintf("%v@%v", log.FormatLogfmtUint64(s.bytecodeSynced), s.bytecodeBytes.TerminalString())
 	)
+	syncProgressGauge.Update(float64(synced) / estBytes)
+	syncBytesGauge.Update(int64(synced))
+	syncEstimateGauge.Update(int64(estBytes))
+	syncAccountsGauge.Update(int64(s.accountSynced))
+	syncSlotsGauge.Update(int64(s.storageSynced))
+	syncCodesGauge.Update(int64(s.bytecodeSynced))
+
 	log.Info("Syncing: state download in progress", "synced", progress, "state", synced,
 		"accounts", accounts, "slots", storage, "codes", bytecode, "eta", common.PrettyDuration(estTime-elapsed))
 }
